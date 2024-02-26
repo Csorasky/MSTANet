@@ -1,4 +1,4 @@
-> 本代码使用开源框架OpenSTL训练、测试
+> This code uses the open-source framework OpenSTL for training and testing
 >
 > `@article{tan2023openstl,`
 >   `title={OpenSTL: A Comprehensive Benchmark of Spatio-Temporal Predictive Learning},`
@@ -13,9 +13,9 @@
 
 ## get started
 
-1.将`OpenSTL/openstl/methods/simvp.py`中的代码替换为`MSTANet_loss.py`中的代码
+1.Replace the code in`OpenSTL/openstl/methods/simvp.py`with the code in`MSTANet_loss.py`
 
-2.将`OpenSTL/openstl/models/simvp_model.py`中的代码替换为`MSTANet_model.py`中的代码
+2.Replace the code in`OpenSTL/openstl/models/simvp_model.py`with the code in`MSTANet_model.py`
 
 3.train/test
 
