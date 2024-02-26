@@ -1,12 +1,8 @@
-import torch.nn as nn
-import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
 from timm.models.layers import DropPath, trunc_normal_
 import math
-
-
 
 def merge(x1, x2):
     return torch.cat((x1, x2), 1)
@@ -42,70 +38,9 @@ class psi(nn.Module):
         output = output.permute(0, 4, 1, 3, 2)
         return output.contiguous()
 
-class irevnet_block(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1, first=False, dropout_rate=0.,
-                 affineBN=True, mult=2):
-        """ buid invertible bottleneck block """
-        super(irevnet_block, self).__init__()
-        self.first = first
-        self.stride = stride
-        self.psi = psi(stride)
-        layers = []
-        if not first:
-            layers.append(nn.BatchNorm3d(in_ch//2, affine=affineBN))
-            layers.append(nn.ReLU(inplace=True))
-        if int(out_ch//mult)==0:
-            ch = 1
-        else:
-            ch =int(out_ch//mult)
-        if self.stride ==2:
-            layers.append(nn.Conv3d(in_ch // 2, ch, kernel_size=3,
-                                    stride=(1,2,2), padding=1, bias=False))
-        else:
-            layers.append(nn.Conv3d(in_ch // 2, ch, kernel_size=3,
-                                    stride=self.stride, padding=1, bias=False))
-        layers.append(nn.BatchNorm3d(ch, affine=affineBN))
-        layers.append(nn.ReLU(inplace=True))
-        layers.append(nn.Conv3d(ch, ch,
-                      kernel_size=3, padding=1, bias=False))
-        layers.append(nn.Dropout(p=dropout_rate))
-        layers.append(nn.BatchNorm3d(ch, affine=affineBN))
-        layers.append(nn.ReLU(inplace=True))
-        layers.append(nn.Conv3d(ch, out_ch, kernel_size=3,
-                      padding=1, bias=False))
-        self.bottleneck_block = nn.Sequential(*layers)
-
-    def forward(self, x):
-        """ bijective or injective block forward """
-        x1 = x[0]
-        x2 = x[1]
-        Fx2 = self.bottleneck_block(x2)
-        if self.stride == 2:
-            x1 = self.psi.forward(x1)
-            x2 = self.psi.forward(x2)
-        y1 = Fx2 + x1
-        return (x2, y1)
-
-    def inverse(self, x):
-        """ bijective or injecitve block inverse """
-        x2, y1 = x[0], x[1]
-        if self.stride == 2:
-            x2 = self.psi.inverse(x2)
-        Fx2 = - self.bottleneck_block(x2)
-        x1 = Fx2 + y1
-        if self.stride == 2:
-            x1 = self.psi.inverse(x1)
-        x = (x1, x2)
-        return x
 
 
 class SimVP_Model(nn.Module):
-    r"""SimVP Model
-
-    Implementation of `SimVP: Simpler yet Better Video Prediction
-    <https://arxiv.org/abs/2206.05099>`_.
-
-    """
 
     def __init__(self, in_shape, hid_S=64, hid_T=512, N_S=4, N_T=8, model_type='gSTA',
                  mlp_ratio=8., drop=0.0, drop_path=0.0, spatio_kernel_enc=3,
@@ -134,9 +69,8 @@ class SimVP_Model(nn.Module):
         embed, skip = self.enc(x)
         _, C_, H_, W_ = embed.shape
 
-        # 预测
+        # predictor
         z = embed.view(B, T, C_, H_, W_)
-        #print(z.shape) 1, 10, 16, 16, 16
         hid = self.hid(z)
         hid = hid.reshape(B*T, C_, H_, W_)
 
@@ -156,9 +90,10 @@ def sampling_generator(N, reverse=False):
 
 
 class Encoder(nn.Module):
-    """3D Encoder for SimVP"""
+    """Encoder for MSTANet"""
 
     def __init__(self, C_in, C_hid, N_S, spatio_kernel):
+
         samplings = sampling_generator(N_S)
         super(Encoder, self).__init__()
         self.enc = nn.Sequential(
@@ -166,19 +101,24 @@ class Encoder(nn.Module):
             *[ConvSC(C_hid, C_hid, spatio_kernel, downsampling=s) for s in samplings[1:]]
         )
 
-    def forward(self, x):  # B*4, 3, 128, 128
-        enc1 = self.enc[0](x)
-        latent = enc1
-        for i in range(1, len(self.enc)):
+    def forward(self, x):
+        latent = x
+        print("x", x.shape)
+        for i in range(0, len(self.enc)-1):
             latent = self.enc[i](latent)
-        return latent, enc1
+            print(latent.shape)
+
+        enc1 = self.enc[-1](latent)
+        print(enc1.shape)
+
+        return enc1, enc1
 
 
 class Decoder(nn.Module):
-    """3D Decoder for SimVP"""
+    """Decoder for MSTANet"""
 
     def __init__(self, C_hid, C_out, N_S, spatio_kernel):
-        samplings = sampling_generator(N_S, reverse=True)
+        samplings = sampling_generator(N_S+1, reverse=False)
         super(Decoder, self).__init__()
         self.dec = nn.Sequential(
             *[ConvSC(C_hid, C_hid, spatio_kernel, upsampling=s) for s in samplings[:-1]],
@@ -186,28 +126,31 @@ class Decoder(nn.Module):
         )
         self.readout = nn.Conv2d(C_hid, C_out, 1)
         self.sigmoid = self.activate = nn.LeakyReLU(0.2)
-        # lstm需要的
+        self.num_hidden = C_hid
         self.conv1 = nn.Conv2d(
-            C_hid, C_hid, kernel_size=3,
+            C_hid, C_hid*2, kernel_size=3,
             stride=1, padding=1)
         self.conv2 = nn.Conv2d(
-            C_hid, C_hid, kernel_size=3,
+            C_hid, C_hid*2, kernel_size=3,
             stride=1, padding=1)
 
-        # lstm版本
-        # 7.11 激活函数更改为relu
     def forward(self, hid, enc1=None):
-            for i in range(0, len(self.dec) - 1):
-                hid = self.dec[i](hid)
-            # 残差连接在这
             v = hid
+            v = self.dec[0](v)
             z = enc1
-            f = self.sigmoid(self.conv1(z))
-            i = self.sigmoid(self.conv2(z))
-            G = f * z + i * v
-            Y = self.dec[-1](G)
-            # Y = self.dec[-1](hid + enc1)
-            Y = self.readout(Y)
+            v_concat = self.conv1(v)
+            z_concat = self.conv2(z)
+            v_f, v_i = torch.split(v_concat, self.num_hidden, dim=1)
+            z_f, z_i = torch.split(z_concat, self.num_hidden, dim=1)
+            f = self.sigmoid(v_f + z_f)
+            i = self.sigmoid(v_i + z_i)
+            hid = f * z + i * v
+            print("enc",hid.shape)
+            for i in range(1, len(self.dec)):
+                hid = self.dec[i](hid)
+                print("enc",hid.shape)
+            Y = self.readout(hid)
+
             return Y
 
 
@@ -276,7 +219,7 @@ class ConvSC(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    """Large Kernel Attention for SimVP"""
+    """Large Kernel Attention for MSTANet"""
 
     def __init__(self, dim, kernel_size, dilation=3):
         super().__init__()
@@ -352,7 +295,7 @@ class MixMlp(nn.Module):
 
 
 class MetaBlock(nn.Module):
-    """The hidden Translator of MetaFormer for SimVP"""
+
     def __init__(self, in_channels, out_channels, input_resolution=None, model_type=None,
                  mlp_ratio=8., drop=0.0, drop_path=0.0, layer_i=0):
         super(MetaBlock, self).__init__()
@@ -361,7 +304,7 @@ class MetaBlock(nn.Module):
         model_type = model_type.lower() if model_type is not None else 'gsta'
 
         if model_type == 'van':
-            self.block = MAB(n_feats=in_channels)
+            self.block = Predictor(n_feats=in_channels)
 
         else:
             assert False and "Invalid model_type in SimVP"
@@ -376,7 +319,7 @@ class MetaBlock(nn.Module):
 
 
 class MidMetaNet(nn.Module):
-    """The hidden Translator of MetaFormer for SimVP"""
+
 
     def __init__(self, channel_in, channel_hid, N2,
                  input_resolution=None, model_type=None,
@@ -467,8 +410,7 @@ class SGAB(nn.Module):
 
         return x * self.scale + shortcut
 
-# 多尺度 时间+空间注意
-class GroupGLKA(nn.Module):
+class FeSFR(nn.Module):
     def __init__(self, n_feats,k=2, squeeze_factor=15):
         super().__init__()
         i_feats = 2 * n_feats
@@ -482,7 +424,7 @@ class GroupGLKA(nn.Module):
         self.norm = LayerNorm(n_feats, data_format='channels_first')
         self.scale = nn.Parameter(torch.zeros((1, n_feats, 1, 1)), requires_grad=True)
 
-        # Multiscale Large Kernel Attention
+        # Multiscale sp Attention
         self.LKA7 = nn.Sequential(
             nn.Conv2d(n_feats , n_feats , 7, 1, 7 // 2, groups=n_feats ),
             nn.Conv2d(n_feats , n_feats, 9, stride=1, padding=(9 // 2) * 4, groups=n_feats, dilation=4),
@@ -506,7 +448,7 @@ class GroupGLKA(nn.Module):
         self.proj_last = nn.Sequential(
             nn.Conv2d(n_feats, n_feats, 1, 1, 0))
 
-        # 时间注意
+        # Multiscale time Attention
         self.pool_conv = nn.Conv2d(n_feats,n_feats,16,stride=16,groups=n_feats)
 
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -540,37 +482,33 @@ class GroupGLKA(nn.Module):
 
         a = self.LKA3(a_1) * self.X3(a_1)+self.LKA5(a_2) * self.X5(a_2)+self.LKA7(a_3) * self.X7(a_3)
 
-        #x = self.proj_last(x * a)
-        # 时间注意力
         b, c, H, W = x.size()
         c = c//10
-        # 缩小特征图至（h=1，w=1）
-        time_attn = self.pool_conv(x) #卷积缩小
-        time_attn = self.avg_pool(x).view(b, c,10)#池化缩小
-        # 局部时间注意
+        time_attn = self.pool_conv(x)
+        time_attn = self.avg_pool(x).view(b, c,10)
+        # local time attention
         time_attn = self.local_conv(time_attn)
-        #全局时间注意
+        #global time attention
         time_attn = self.global_conv1(time_attn)
         time_attn = self.global_conv2(time_attn).view(b,10,c)
         time_attn = self.global_conv3(time_attn)
         time_attn = self.global_conv4(time_attn).view(b,10*c,1,1)
-        # 注意图与特征图相乘
         attn = time_attn* a
-        x = self.proj_last(x * a)
+        x = self.proj_last(x * attn)
         x = x  * self.scale + shortcut
 
         return x
 
-    # MAB
 
 
-class MAB(nn.Module):
+
+class Predictor(nn.Module):
 
     def __init__(
             self, n_feats):
         super().__init__()
 
-        self.LKA = GroupGLKA(n_feats)
+        self.LKA = FeSFR(n_feats)
 
         self.LFE = SGAB(n_feats)
 
@@ -582,3 +520,8 @@ class MAB(nn.Module):
         x = self.LFE(x)
 
         return x
+
+
+
+
+
